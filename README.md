@@ -10,7 +10,7 @@
 - **VLC engine:** Reliable audio/video playback via VLC.
 - **Clean UI:** PySide6 (Qt) interface with custom-styled controls.
 - **Dual modes:** Main window and mini-player, both synced.
-- **Shortcuts;** hide the mini player's HUD with H, press F for Fullscreen, and navigate the video with the arrow keys.
+- **Shortcuts:** hide the mini player's HUD with H, press F for Fullscreen, and navigate the video with the arrow keys.
 
 ---
 
