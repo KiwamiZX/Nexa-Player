@@ -16,7 +16,7 @@
 ## 📦 Requirements and Compiling
 
 - **Python:** 3.10+
-- **VLC Media Player:** 64-Bits VLC only (For now)
+- **VLC Media Player:** 64-Bits VLC only (For now) [Download it here](https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.exe)
 - **Requirements:**
   ```bash
   pip install PySide6 python-vlc
