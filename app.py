@@ -105,24 +105,36 @@ class VideoBuffer:
         pass
 
 
+import subprocess
+
 def get_frame_at(video_path: str, ms: int, width: int = 160, height: int = 90) -> QPixmap | None:
     try:
         time_sec = ms / 1000.0
+
+        # suprimir janela de terminal no Windows
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
+
         out, _ = (
             ffmpeg
             .input(video_path, ss=time_sec)
             .filter('scale', width, height)
             .output('pipe:', vframes=1, format='rawvideo', pix_fmt='rgb24')
-            .run(capture_stdout=True, capture_stderr=True, quiet=True)
+            .run(capture_stdout=True, capture_stderr=True, quiet=True,
+                 overwrite_output=True,
+                 creationflags=creationflags)
         )
+
         if not out:
             return None
+
         frame = np.frombuffer(out, np.uint8).reshape((height, width, 3))
         qimg = QImage(frame.data, width, height, 3 * width, QImage.Format_RGB888)
         return QPixmap.fromImage(qimg)
+
     except Exception as e:
         print("Erro FFmpeg:", e)
         return None
+
 
 
 class SeekSlider(QSlider):
