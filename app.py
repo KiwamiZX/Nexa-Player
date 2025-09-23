@@ -779,6 +779,10 @@ class App(QApplication):
             self.mini = PlayerWindow("Nexa Player - PIP", is_broadcast=False)
             self.mini.resize(320, 180)
             self.mini.show()
+
+            # se já houver vídeo carregado, atualiza o título
+            if self.video_path:
+                self.update_titles(self.video_path)
         elif not enabled and self.mini is not None:
             self.mini.close()
             self.mini = None
@@ -804,6 +808,7 @@ class App(QApplication):
         # inicia player, etc.
         self.mediaplayer.set_media(self.instance.media_new(path))
         self.mediaplayer.play()
+        self.update_titles(path)
 
         # limpa cache de miniaturas
         self.thumbnail_cache = {}
@@ -963,4 +968,10 @@ class App(QApplication):
 # --- Main ---
 if __name__ == "__main__":
     app = App(sys.argv)
+
+    # Se o usuário arrastou um arquivo no ícone ou usou "Abrir com"
+    if len(sys.argv) > 1:
+        path = sys.argv[1]
+        app.open_path(path)
+
     sys.exit(app.exec())
