@@ -1,5 +1,5 @@
 import sys, os, urllib.parse, ctypes, tempfile
-import ffmpeg
+import cv2
 import numpy as np
 import time
 import ctypes
@@ -17,15 +17,16 @@ import vlc
 import resources_rc
 
 
-def probe_duration_ms(path: str) -> int | None:
-    try:
-        import ffmpeg
-        info = ffmpeg.probe(path)
-        dur_s = float(info["format"]["duration"])
-        return int(dur_s * 1000)
-    except Exception as e:
-        print("Erro FFmpeg probe:", e)
-        return None
+def get_video_duration(path: str) -> int:
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return 0
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    if fps > 0:
+        return int((frame_count / fps) * 1000)  # duração em milissegundos
+    return 0
 # ---------------- Helpers ----------------
 def ms_to_minsec(ms):
     if ms <= 0:
@@ -53,31 +54,30 @@ class ThumbnailWorker(QThread):
         self._running = True
 
     def run(self):
-        try:
-            info = ffmpeg.probe(self.video_path)
-            dur_s = float(info["format"]["duration"])
-        except Exception as e:
-            print("Erro probe:", e)
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            print("Erro ao abrir vídeo:", self.video_path)
             return
 
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        dur_ms = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps * 1000
+
         t = 0
-        while self._running and t < dur_s:
-            try:
-                out, _ = (
-                    ffmpeg
-                    .input(self.video_path, ss=t)
-                    .filter('scale', self.width, self.height)
-                    .output('pipe:', vframes=1, format='rawvideo', pix_fmt='rgb24')
-                    .run(capture_stdout=True, capture_stderr=True, quiet=True)
-                )
-                if out:
-                    frame = np.frombuffer(out, np.uint8).reshape((self.height, self.width, 3))
-                    qimg = QImage(frame.data, self.width, self.height, 3*self.width, QImage.Format_RGB888)
-                    pix = QPixmap.fromImage(qimg)
-                    self.thumbnail_ready.emit(int(t*1000), pix)
-            except Exception as e:
-                print("Erro thumb:", e)
-            t += self.interval_s
+        while self._running and t < dur_ms:
+            frame_num = int((t / 1000.0) * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            success, frame = cap.read()
+            if success:
+                frame = cv2.resize(frame, (self.width, self.height))
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb.shape
+                bytes_per_line = ch * w
+                qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                pix = QPixmap.fromImage(qimg)
+                self.thumbnail_ready.emit(int(t), pix)
+            t += self.interval_s * 1000
+
+        cap.release()
 
     def stop(self):
         self._running = False
@@ -106,34 +106,52 @@ class VideoBuffer:
 
 
 import subprocess
+import sys
 
 def get_frame_at(video_path: str, ms: int, width: int = 160, height: int = 90) -> QPixmap | None:
     try:
         time_sec = ms / 1000.0
+        args = [
+            "ffmpeg",
+            "-ss", str(time_sec),
+            "-i", video_path,
+            "-vframes", "1",
+            "-vf", f"scale={width}:{height}",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-loglevel", "quiet",
+            "pipe:1"
+        ]
 
-        # suprimir janela de terminal no Windows
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
+        # suprimir janela no Windows
+        startupinfo = None
+        if sys.platform.startswith("win"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-        out, _ = (
-            ffmpeg
-            .input(video_path, ss=time_sec)
-            .filter('scale', width, height)
-            .output('pipe:', vframes=1, format='rawvideo', pix_fmt='rgb24')
-            .run(capture_stdout=True, capture_stderr=True, quiet=True,
-                 overwrite_output=True,
-                 creationflags=creationflags)
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            startupinfo=startupinfo
         )
 
-        if not out:
+        raw = proc.stdout.read(width * height * 3)
+        proc.stdout.close()
+        proc.wait()
+
+        if not raw:
             return None
 
-        frame = np.frombuffer(out, np.uint8).reshape((height, width, 3))
+        frame = np.frombuffer(raw, np.uint8).reshape((height, width, 3))
         qimg = QImage(frame.data, width, height, 3 * width, QImage.Format_RGB888)
         return QPixmap.fromImage(qimg)
 
     except Exception as e:
         print("Erro FFmpeg:", e)
         return None
+
 
 
 
@@ -147,11 +165,6 @@ class SeekSlider(QSlider):
         self.preview_label.setWindowFlags(Qt.ToolTip)
         self.preview_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.preview_label.hide()
-
-        # Cache de miniaturas
-        self.thumbnail_cache = {}
-        self.last_preview_time = 0
-        self.throttle_ms = 200  # só gera preview a cada 200ms
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
@@ -219,6 +232,7 @@ class SeekSlider(QSlider):
     def leaveEvent(self, event):
         self.preview_label.hide()
         super().leaveEvent(event)
+
 
 # ---------------- Player window ----------------
 class PlayerWindow(QWidget):
@@ -783,45 +797,25 @@ class App(QApplication):
         self.mediaplayer.set_rate(rate)
         self.broadcast.show_overlay_message(f"Speed: {rate:.2f}x")
 
-
-
     def open_path(self, path: str):
-        try:
-            media = self.instance.media_new(path)
-            media.add_option(":input-repeat=-1")  # mantém como estava antes
-            self.mediaplayer.set_media(media)
-            self.mediaplayer.play()
-
-            # Atualiza títulos o quanto antes (é leve)
-            mrl = media.get_mrl()
-            self.update_titles(mrl)
-        except Exception as e:
-            print("Erro ao preparar/rodar mídia:", e)
-
-        # Sempre salva o caminho (mesmo se VLC falhar)
         self.video_path = path
-        if self.thumbnail_worker:
+        self.video_duration_ms = get_video_duration(path)  # função que retorna duração em ms
+
+        # inicia player, etc.
+        self.mediaplayer.set_media(self.instance.media_new(path))
+        self.mediaplayer.play()
+
+        # limpa cache de miniaturas
+        self.thumbnail_cache = {}
+
+        # para worker anterior, se existir
+        if hasattr(self, "thumbnail_worker") and self.thumbnail_worker:
             self.thumbnail_worker.stop()
 
-        self.thumbnail_cache.clear()
+        # inicia novo worker com OpenCV
         self.thumbnail_worker = ThumbnailWorker(path, interval_s=5)
         self.thumbnail_worker.thumbnail_ready.connect(self._store_thumbnail)
         self.thumbnail_worker.start()
-
-        # Sonda duração com ffmpeg, sem deixar travar a função
-        try:
-            self.video_duration_ms = probe_duration_ms(path)
-            # Se quiser, loga para confirmar
-            print("Duração (ms):", self.video_duration_ms)
-        except Exception as e:
-            print("Erro ao sondar duração FFmpeg:", e)
-            self.video_duration_ms = None
-
-        # Ícones (com segurança)
-        if getattr(self, "broadcast", None):
-            self.broadcast.play_btn.setIcon(self.broadcast.icon_pause)
-        if getattr(self, "mini", None):
-            self.mini.play_btn.setIcon(self.mini.icon_pause)
 
     def _store_thumbnail(self, time_ms: int, pix: QPixmap):
         self.thumbnail_cache[time_ms] = pix
