@@ -963,7 +963,8 @@ class App(QApplication):
     def update_titles(self, mrl: str):
         filename = clean_filename_from_mrl(mrl)
         self.broadcast.setWindowTitle(f"{filename} - Nexa Player")
-        self.mini.setWindowTitle(f"{filename} - Nexa Player - PIP")
+        if self.mini is not None:
+            self.mini.setWindowTitle(f"{filename} - Nexa Player - PIP")
 
 # --- Main ---
 if __name__ == "__main__":
