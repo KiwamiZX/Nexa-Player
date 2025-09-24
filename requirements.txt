@@ -1,4 +1,4 @@
 python-vlc
 PySide6
-cv2
+opencv-python
 ffmpeg-python
