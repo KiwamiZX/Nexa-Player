@@ -1,3 +1,4 @@
+<p align=center><img width="300" height="300" alt="nexaplayer" src="https://github.com/user-attachments/assets/51093eee-c5ed-4ac6-ba2a-3408f037d8e5" /></p>
 # NexaPlayer 🎵▶️
 
 - A sleek, minimalist media player built with **Python, PySide6, and python-vlc.** 
@@ -13,6 +14,15 @@
 - **Shortcuts:** hide the mini player's HUD with H, press F for Fullscreen, and navigate the video with the arrow keys.
 
 ---
+
+## Screenshots
+
+<img width="1290" height="750" alt="image" src="https://github.com/user-attachments/assets/9ce6dc4e-8b44-48a4-b226-a791464f591a" />
+
+
+<img width="1073" height="739" alt="image" src="https://github.com/user-attachments/assets/1e502d7f-4c99-4629-b3cd-4432662e4ff5" />
+
+
 
 ## 📦 Requirements and Compiling
 
