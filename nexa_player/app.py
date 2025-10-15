@@ -40,9 +40,12 @@ from .ui.playlist_dialog import PlaylistDialog
 
 log = logging.getLogger(__name__)
 
+_log = log.getChild("playback")
+
 
 class NexaApp(QApplication):
     media_finished = Signal()
+    media_end = Signal()
 
     def __init__(self, argv):
         super().__init__(argv)
@@ -79,6 +82,8 @@ class NexaApp(QApplication):
         self.loop_playlist = False
         self.loop_enabled = False
         self.media_finished.connect(self._play_next_safe)
+        # Ensure media_end signal schedules handling on the Qt main thread
+        self.media_end.connect(self._on_media_end_queued)
 
         self.miniplayer_enabled = self.state.get_miniplayer_enabled()
 
@@ -137,6 +142,8 @@ class NexaApp(QApplication):
 
         self._last_ui_second = -1
         self._pending_resume_ms: Optional[int] = None
+        # Guard to avoid handling the same media-end multiple times
+        self._handling_end = False
 
         self.aboutToQuit.connect(self._cleanup)
 
@@ -239,22 +246,92 @@ class NexaApp(QApplication):
             log.exception("Error in _on_media_playing")
 
     def _on_media_end(self, event):
-        log.info("End of media detected by VLC")
-        self.state.clear_resume_position(self.video_path or "")
-        if self.loop_enabled:
-            QTimer.singleShot(0, self._restart_media)
-        else:
-            self.media_finished.emit()
+        # VLC may call this from a non-Qt thread. Schedule handling on the
+        # Qt main thread to avoid re-entrant calls into the media player
+        # and to keep UI interactions thread-safe.
+        log.info("End of media detected by VLC (scheduling main-thread handler)")
+        try:
+            _log.debug("_on_media_end called: state=%s current_index=%s playlist_len=%s loop_enabled=%s loop_playlist=%s", self.mediaplayer.get_state(), self.current_index, len(self.playlist), self.loop_enabled, self.loop_playlist)
+        except Exception:
+            log.debug("_on_media_end: failed to read mediaplayer state for debug")
 
-        self.mediaplayer.stop()
-        self.mediaplayer.set_time(0)
-        self._start_playback()
-        self.mediaplayer.play()
-        self._set_play_icon(True)
+        # Emit a Qt signal which is queued to the main thread; the slot will
+        # schedule the actual handler with QTimer.singleShot on the main thread.
+        _log.debug("_on_media_end: emitting media_end signal (queued to main thread)")
+        try:
+            self.media_end.emit()
+        except Exception:
+            log.exception("Failed to emit media_end signal")
+
+    def _handle_media_end(self):
+        """Handle media end on the Qt main thread (scheduled from VLC callback).
+
+        This was extracted to an instance method to make scheduling/diagnostics
+        more reliable and visible in logs.
+        """
+        try:
+            if getattr(self, "_handling_end", False):
+                _log.debug("_handle_media_end: already handling end, skipping")
+                return
+            self._handling_end = True
+            _log.debug("_handle_media_end start: video_path=%s current_index=%s playlist_len=%s", self.video_path, self.current_index, len(self.playlist))
+            self.state.clear_resume_position(self.video_path or "")
+
+            # If there is a next item in the playlist, advance to it.
+            try:
+                has_next = bool(self.playlist and (self.current_index + 1 < len(self.playlist) or self.loop_playlist))
+                _log.debug("_handle_media_end: has_next=%s current_index=%s playlist_len=%s", has_next, self.current_index, len(self.playlist))
+                if has_next:
+                    _log.debug("_handle_media_end: advancing to next track (current_index=%s)", self.current_index)
+                    self._play_next_safe()
+                    return
+            except Exception:
+                log.exception("Error while determining/advancing to next track at media end")
+
+            # If loop is enabled, restart the same media.
+            if self.loop_enabled:
+                _log.debug("_handle_media_end: loop_enabled, restarting media")
+                self._restart_media()
+                return
+
+            # No playlist next and not looping: reset to start so Play will restart.
+            _log.debug("_handle_media_end: no next track, not looping - resetting playback state")
+            try:
+                self.mediaplayer.stop()
+            except Exception:
+                log.debug("mediaplayer.stop() failed at media end, continuing")
+
+            try:
+                self.mediaplayer.set_time(0)
+            except Exception:
+                log.debug("mediaplayer.set_time(0) failed at media end, ignoring")
+
+            # Ensure UI shows stopped state; user can press Play to start (handled by play_pause)
+            self._set_play_icon(False)
+        except Exception:
+            log.exception("Exception in _handle_media_end")
+        finally:
+            # allow future end events to be handled
+            self._handling_end = False
+
+    def _on_media_end_queued(self):
+        """Called on the Qt main thread when a media-end is reported by VLC.
+
+        Schedule the actual handler with a small delay to avoid racing with
+        VLC internals.
+        """
+        _log.debug("_on_media_end_queued: scheduling _handle_media_end in 150ms and 600ms backup")
+        QTimer.singleShot(150, self._handle_media_end)
+        QTimer.singleShot(600, self._handle_media_end)
 
     def _start_playback(self):
         self._playback_retry_attempts = 0
+        # Indicate we expect playback to become active so the playback-check
+        # loop (_ensure_playing_state) will run and retry if necessary.
+        self._playing_expected = True
+        _log.debug("_start_playback: starting playback (state=%s, video_path=%s) playing_expected set to True", self.mediaplayer.get_state(), self.video_path)
         result = self.mediaplayer.play()
+        _log.debug("_start_playback: mediaplayer.play() returned %s", result)
         if result == -1:
             log.warning("Initial play request returned -1; will retry")
         self._schedule_playback_check()
@@ -283,6 +360,35 @@ class NexaApp(QApplication):
         log.debug("Retrying playback (attempt %s, state=%s)", self._playback_retry_attempts, state)
         self.mediaplayer.play()
         self._schedule_playback_check()
+
+    def _restart_media(self):
+        """Safely restart the currently loaded media from the beginning.
+
+        This method is defensive: VLC callbacks may come from non-Qt threads,
+        so callers should schedule this on the Qt thread (e.g. via
+        QTimer.singleShot(0, self._restart_media)). It stops, seeks to 0 and
+        attempts to play, updating the UI play icon.
+        """
+        try:
+            # Stop first to ensure a clean restart
+            try:
+                self.mediaplayer.stop()
+            except Exception:
+                log.debug("mediaplayer.stop() failed during restart, continuing")
+
+            try:
+                self.mediaplayer.set_time(0)
+            except Exception:
+                log.debug("mediaplayer.set_time(0) failed during restart, continuing")
+
+            # Schedule a short delayed start to allow VLC to reset internal state
+            try:
+                QTimer.singleShot(50, self._start_playback)
+                self._set_play_icon(True)
+            except Exception:
+                log.exception("Failed to schedule media restart")
+        except Exception:
+            log.exception("Unexpected error in _restart_media")
 
     # ------------------------------------------------------------------
     # UI integration
@@ -331,12 +437,22 @@ class NexaApp(QApplication):
                 self.open_path(file)
 
     def open_path(self, path: str):
+        _log.debug("open_path: opening path=%s", path)
         if self.mediaplayer.is_playing():
             self.mediaplayer.stop()
         media = self.instance.media_new(path)
         self.mediaplayer.set_media(media)
-        self._start_playback()
+        # Schedule playback start slightly later to give VLC time to attach media
+        QTimer.singleShot(50, self._start_playback)
         self.video_path = path
+        # If this path exists in the current playlist, update current_index so
+        # playlist advancement knows where we are.
+        try:
+            if path in self.playlist:
+                self.current_index = self.playlist.index(path)
+                _log.debug("open_path: set current_index=%s for path", self.current_index)
+        except Exception:
+            _log.debug("open_path: failed to set current_index for path=%s", path)
         self.state.set_last_file(path)
         self.video_duration_ms = get_video_duration(path)
         self.has_media = True
@@ -381,15 +497,27 @@ class NexaApp(QApplication):
 
     def play_pause(self):
         state = self.mediaplayer.get_state()
+        _log.debug("play_pause called: state=%s playing_expected=%s current_index=%s playlist_len=%s", state, self._playing_expected, self.current_index, len(self.playlist))
+
+        # If media reached the end, restart or advance depending on settings
         if state == self.vlc.State.Ended:
+            _log.debug("play_pause: media state Ended")
+            # Use restart path which schedules a safe start; loop case will restart too
+            try:
+                self.mediaplayer.set_time(0)
+            except Exception:
+                log.debug("set_time(0) failed when restarting ended media")
             self._restart_media()
             return
 
         if self._playing_expected:
+            _log.debug("play_pause: pausing playback")
             self.mediaplayer.pause()
             self._set_play_icon(False)
         else:
-            self.mediaplayer.play()
+            _log.debug("play_pause: requesting playback start")
+            # Use the common start path which includes retry logic
+            self._start_playback()
             self._set_play_icon(True)
 
     def stop(self):
@@ -581,18 +709,40 @@ class NexaApp(QApplication):
     # Playlist advancement
 
     def _play_next_safe(self):
+        _log.debug("_play_next_safe: current_index=%s playlist_len=%s loop_playlist=%s video_path=%s", self.current_index, len(self.playlist), self.loop_playlist, self.video_path)
         if not self.playlist:
             self.current_index = -1
+            _log.debug("_play_next_safe: no playlist")
             return
+
+        # If current_index is invalid, try to locate the current video_path in playlist
+        if self.current_index < 0 or self.current_index >= len(self.playlist):
+            try:
+                if self.video_path and self.video_path in self.playlist:
+                    self.current_index = self.playlist.index(self.video_path)
+                    _log.debug("_play_next_safe: repaired current_index=%s from video_path", self.current_index)
+                else:
+                    _log.debug("_play_next_safe: current_index invalid and video_path not in playlist")
+                    return
+            except Exception:
+                _log.exception("_play_next_safe: failed to repair current_index")
+                return
+
         next_index = self.current_index + 1
         if next_index >= len(self.playlist):
             if self.loop_playlist:
                 next_index = 0
             else:
+                _log.debug("_play_next_safe: reached end of playlist and loop_playlist is False")
                 return
+
         self.current_index = next_index
         path = self.playlist[self.current_index]
-        self.mediaplayer.stop()
+        _log.debug("_play_next_safe: advancing to index=%s path=%s", self.current_index, path)
+        try:
+            self.mediaplayer.stop()
+        except Exception:
+            log.debug("_play_next_safe: mediaplayer.stop() failed, continuing")
         self.open_path(path)
 
     # ------------------------------------------------------------------

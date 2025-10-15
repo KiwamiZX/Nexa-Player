@@ -426,11 +426,12 @@ class PlayerWindow(QWidget):
                 self.position.show()
                 self.hud_container.show()
             else:
-                self.setWindowFlags(
-                    Qt.Window | Qt.WindowTitleHint | Qt.CustomizeWindowHint | Qt.WindowStaysOnTopHint
-                )
+                # For mini-player, hide the window decorations so the top/title
+                # bar is not visible when HUD is hidden. Keep the window on top.
+                self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+                # showNormal() applies the new flags on many window managers
                 self.showNormal()
-                self.setWindowTitle(self.windowTitle())
+                # don't set the window title here (frameless)
                 self.position.hide()
                 self.hud_container.hide()
 
@@ -550,25 +551,15 @@ class PlayerWindow(QWidget):
         else:
             subs_menu.addAction("(No subtitles)").setEnabled(False)
 
-        menu.exec(self.label.mapToGlobal(pos))
-        if subs:
-            for sid, desc in subs:
-                text = desc.decode("utf-8", errors="ignore") if isinstance(desc, (bytes, bytearray)) else str(desc)
-                action = QAction(text, self)
-                action.setCheckable(True)
-                if sid == app.mediaplayer.video_get_spu():
-                    action.setChecked(True)
-                action.triggered.connect(lambda checked, s=sid: app.set_subtitle(s))
-                subs_menu.addAction(action)
-        else:
-            subs_menu.addAction("(No subtitles)").setEnabled(False)
-
+        # We've already populated subs_menu above. Show the menu once.
         mini_action = QAction("Enable Mini-player", self)
         mini_action.setCheckable(True)
         mini_action.setChecked(app.miniplayer_enabled)
         mini_action.triggered.connect(lambda checked: app.toggle_miniplayer(checked))
         menu.addAction(mini_action)
 
+        # Show context menu once. Avoid re-adding submenu entries which caused
+        # duplicated items and double-open behaviour on some platforms.
         menu.exec(self.label.mapToGlobal(pos))
 
     def update_frame(self):
